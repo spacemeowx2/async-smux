@@ -1,5 +1,5 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use std::io::{self, Cursor, Error, ErrorKind};
 

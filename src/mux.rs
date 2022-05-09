@@ -10,10 +10,12 @@ use std::{
 };
 
 use async_channel::{bounded, Receiver, Sender};
-use async_lock::Mutex;
 use bytes::{Buf, Bytes};
-use futures::{io::ReadHalf, io::WriteHalf, ready, AsyncRead, AsyncReadExt, AsyncWrite, Future};
-use futures_lite::FutureExt as LiteFutureExt;
+use futures::{future::select, pin_mut, ready, Future};
+use tokio::{
+    io::{split, AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf},
+    sync::Mutex,
+};
 
 use crate::{
     frame::{Command, Frame, FrameIo},
@@ -68,7 +70,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Mux<T> {
     /// Panics if the config is not valid. Call `MuxConfig::check()` to make sure the config is valid.
     pub fn new(inner: T, config: MuxConfig) -> Self {
         let (accept_stream_tx, accept_stream_rx) = bounded(config.stream_buffer_size);
-        let (reader, writer) = inner.split();
+        let (reader, writer) = split(inner);
         let config = Arc::new(config);
 
         let frame_reader = Arc::new(Mutex::new(FrameIo::new(reader)));
@@ -271,7 +273,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxFutureGenerator<T> {
                     }
                 }
             };
-            loop_fut.race(channel_fut).await
+            pin_mut!(loop_fut, channel_fut);
+
+            select(loop_fut, channel_fut).await.factor_first().0
         })
     }
 }
@@ -374,7 +378,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> FrameFutureGenerator<T>
                     }
                 }
             };
-            loop_fut.race(channel_fut).await
+            pin_mut!(loop_fut, channel_fut);
+            select(loop_fut, channel_fut).await.factor_first().0
         })
     }
 
@@ -446,8 +451,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for MuxStream
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        buf: &mut ReadBuf,
+    ) -> Poll<io::Result<()>> {
         if let CloseState::Closed = self.close_state {
             return Poll::Ready(Err(Error::MuxStreamClosed(self.stream_id).into()));
         }
@@ -467,15 +472,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for MuxStream
                     continue;
                 }
                 ReadState::Reading(ref mut payload) => {
-                    if payload.len() > buf.len() {
-                        payload.copy_to_slice(&mut buf[..]);
-                        return Poll::Ready(Ok(buf.len()));
+                    if payload.len() > buf.remaining() {
+                        let to_copy = payload.len().min(buf.remaining());
+                        payload.copy_to_slice(&mut buf.initialize_unfilled_to(to_copy));
+                        buf.advance(to_copy);
                     } else {
                         let len = payload.len();
-                        buf[..len].copy_from_slice(&payload);
+                        buf.initialize_unfilled_to(len)[..len].copy_from_slice(&payload);
+                        buf.advance(len);
                         self.read_state = ReadState::Idle;
-                        return Poll::Ready(Ok(len));
                     }
+                    return Poll::Ready(Ok(()));
                 }
             }
         }
@@ -519,7 +526,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for MuxStrea
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             match self.close_state {
                 CloseState::Idle => {
@@ -542,10 +549,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for MuxStrea
 #[cfg(test)]
 mod test {
     use async_channel::bounded;
-    use futures::{AsyncWriteExt, StreamExt};
+    use futures::StreamExt;
     use log::LevelFilter;
     use rand::prelude::*;
-    use smol::net::{TcpListener, TcpStream};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
 
     use super::*;
 
@@ -553,162 +563,148 @@ mod test {
         let _ = env_logger::builder()
             .filter_level(LevelFilter::Info)
             .try_init();
-        std::env::set_var("SMOL_THREADS", "16");
+        std::env::set_var("tokio_THREADS", "16");
     }
 
     async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
         let (tx, rx) = bounded(1);
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             tx.send(stream).await.unwrap();
-        })
-        .detach();
+        });
         let client_stream = TcpStream::connect(local_addr).await.unwrap();
         let server_stream = rx.recv().await.unwrap();
         (client_stream, server_stream)
     }
 
-    #[test]
-    fn connect_accept() {
+    #[tokio::test]
+    async fn connect_accept() {
         init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let t = smol::spawn(async move {
-                let mux_a = Mux::new(a, MuxConfig::default());
-                let mut a = mux_a.connect().await.unwrap();
-                a.write_all(b"hello1").await.unwrap();
-                let mut buf = [0u8; 0x100];
-                a.read(&mut buf).await.unwrap();
-            });
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let mut b = mux_b.accept().await.unwrap();
+        let (a, b) = get_tcp_stream_pair().await;
+        let t = tokio::spawn(async move {
+            let mux_a = Mux::new(a, MuxConfig::default());
+            let mut a = mux_a.connect().await.unwrap();
+            a.write_all(b"hello1").await.unwrap();
             let mut buf = [0u8; 0x100];
-            let size = b.read(&mut buf).await.unwrap();
-            log::debug!("{:?}", &buf[..size]);
-            b.write_all(b"hello2").await.unwrap();
-            t.await;
+            a.read(&mut buf).await.unwrap();
         });
+        let mux_b = Mux::new(b, MuxConfig::default());
+        let mut b = mux_b.accept().await.unwrap();
+        let mut buf = [0u8; 0x100];
+        let size = b.read(&mut buf).await.unwrap();
+        log::debug!("{:?}", &buf[..size]);
+        b.write_all(b"hello2").await.unwrap();
+        t.await.unwrap();
     }
 
-    #[test]
-    fn concurrent_connect_accept() {
+    #[tokio::test]
+    async fn concurrent_connect_accept() {
         init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            const STREAM_COUNT: i32 = 100;
-            let t = smol::spawn(async move {
-                let mux_a = Mux::new(a, MuxConfig::default());
-                let (tx, mut rx) = bounded(0x100);
-                for i in 0..STREAM_COUNT {
-                    let mut stream = mux_a.connect().await.unwrap();
-                    log::debug!("connected: {}", i);
-                    let payload = [i as u8; 1];
-                    let tx = tx.clone();
-                    smol::spawn(async move {
-                        stream.write_all(&payload).await.unwrap();
-                        let mut buf = [0u8; 0x100];
-                        let size = stream.read(&mut buf).await.unwrap();
-                        assert_eq!(size, payload.len());
-                        assert_eq!(payload[0] + 1, buf[0]);
-                        tx.send(()).await.unwrap();
-                    })
-                    .detach();
-                }
-                for i in 0..STREAM_COUNT {
-                    log::debug!("a done: {}", i);
-                    rx.next().await.unwrap();
-                }
-            });
-            let (tx, rx) = bounded(0x100);
-            let mux_b = Mux::new(b, MuxConfig::default());
+        let (a, b) = get_tcp_stream_pair().await;
+        const STREAM_COUNT: i32 = 100;
+        let t = tokio::spawn(async move {
+            let mux_a = Mux::new(a, MuxConfig::default());
+            let (tx, mut rx) = bounded(0x100);
             for i in 0..STREAM_COUNT {
-                let mut stream = mux_b.accept().await.unwrap();
-                log::debug!("accepted: {}", i);
+                let mut stream = mux_a.connect().await.unwrap();
+                log::debug!("connected: {}", i);
+                let payload = [i as u8; 1];
                 let tx = tx.clone();
-                smol::spawn(async move {
+                tokio::spawn(async move {
+                    stream.write_all(&payload).await.unwrap();
                     let mut buf = [0u8; 0x100];
                     let size = stream.read(&mut buf).await.unwrap();
-                    for i in buf[..size].iter_mut() {
-                        *i = *i + 1;
-                    }
-                    stream.write_all(&buf[..size]).await.unwrap();
-                    log::debug!("{:?}", &buf[..size]);
+                    assert_eq!(size, payload.len());
+                    assert_eq!(payload[0] + 1, buf[0]);
                     tx.send(()).await.unwrap();
-                })
-                .detach();
+                });
             }
             for i in 0..STREAM_COUNT {
-                log::debug!("b done: {}", i);
-                rx.recv().await.unwrap();
+                log::debug!("a done: {}", i);
+                rx.next().await.unwrap();
             }
-            t.await
         });
+        let (tx, rx) = bounded(0x100);
+        let mux_b = Mux::new(b, MuxConfig::default());
+        for i in 0..STREAM_COUNT {
+            let mut stream = mux_b.accept().await.unwrap();
+            log::debug!("accepted: {}", i);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 0x100];
+                let size = stream.read(&mut buf).await.unwrap();
+                for i in buf[..size].iter_mut() {
+                    *i = *i + 1;
+                }
+                stream.write_all(&buf[..size]).await.unwrap();
+                log::debug!("{:?}", &buf[..size]);
+                tx.send(()).await.unwrap();
+            });
+        }
+        for i in 0..STREAM_COUNT {
+            log::debug!("b done: {}", i);
+            rx.recv().await.unwrap();
+        }
+        t.await.unwrap();
     }
 
-    #[test]
-    fn close() {
+    #[tokio::test]
+    async fn close() {
         init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let mux_a = Mux::new(a, MuxConfig::default());
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let mut stream_a = mux_a.connect().await.unwrap();
-            let mut stream_b = mux_b.accept().await.unwrap();
-            stream_a.write(b"hello").await.unwrap();
-            let mut buf = [0u8; 0x100];
-            let size = stream_b.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..size], b"hello");
-            stream_a.close().await.unwrap();
-            assert!(stream_a.write(b"hello").await.is_err());
-            assert!(stream_b.read(&mut buf).await.is_err());
-            assert!(stream_b.write(b"hello").await.is_err());
-        })
+        let (a, b) = get_tcp_stream_pair().await;
+        let mux_a = Mux::new(a, MuxConfig::default());
+        let mux_b = Mux::new(b, MuxConfig::default());
+        let mut stream_a = mux_a.connect().await.unwrap();
+        let mut stream_b = mux_b.accept().await.unwrap();
+        stream_a.write(b"hello").await.unwrap();
+        let mut buf = [0u8; 0x100];
+        let size = stream_b.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..size], b"hello");
+        stream_a.shutdown().await.unwrap();
+        assert!(stream_a.write(b"hello").await.is_err());
+        assert!(stream_b.read(&mut buf).await.is_err());
+        assert!(stream_b.write(b"hello").await.is_err());
     }
 
-    #[test]
-    fn clean() {
+    #[tokio::test]
+    async fn clean() {
         init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let mux_a = Mux::new(a, MuxConfig::default());
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let stream1_a = mux_a.connect().await.unwrap();
-            let _stream2_a = mux_a.connect().await.unwrap();
-            let mut _stream1_b = mux_b.accept().await.unwrap();
-            let mut _stream2_b = mux_b.accept().await.unwrap();
-            drop(stream1_a);
-            mux_a.clean().await.unwrap();
-            assert_eq!(mux_a.mux_future_generator.stream_meta.lock().await.len(), 1);
-        })
+        let (a, b) = get_tcp_stream_pair().await;
+        let mux_a = Mux::new(a, MuxConfig::default());
+        let mux_b = Mux::new(b, MuxConfig::default());
+        let stream1_a = mux_a.connect().await.unwrap();
+        let _stream2_a = mux_a.connect().await.unwrap();
+        let mut _stream1_b = mux_b.accept().await.unwrap();
+        let mut _stream2_b = mux_b.accept().await.unwrap();
+        drop(stream1_a);
+        mux_a.clean().await.unwrap();
+        assert_eq!(mux_a.mux_future_generator.stream_meta.lock().await.len(), 1);
     }
 
-    #[test]
-    fn huge_payload() {
+    #[tokio::test]
+    async fn huge_payload() {
         init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let mux_a = Mux::new(a, MuxConfig::default());
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let mut stream_a = mux_a.connect().await.unwrap();
-            let mut stream_b = mux_b.accept().await.unwrap();
-            let mut payload = Vec::new();
-            payload.resize(0x100000, 0);
-            rand::thread_rng().fill_bytes(&mut payload);
-            let payload = Arc::new(payload);
-            {
-                let payload = payload.clone();
-                smol::spawn(async move {
-                    stream_a.write_all(&payload).await.unwrap();
-                    stream_a.close().await.unwrap();
-                })
-                .detach();
-            }
-            let mut buf = Vec::new();
-            buf.resize(0x100000, 0);
-            stream_b.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf[..], &payload[..]);
-        })
+        let (a, b) = get_tcp_stream_pair().await;
+        let mux_a = Mux::new(a, MuxConfig::default());
+        let mux_b = Mux::new(b, MuxConfig::default());
+        let mut stream_a = mux_a.connect().await.unwrap();
+        let mut stream_b = mux_b.accept().await.unwrap();
+        let mut payload = Vec::new();
+        payload.resize(0x100000, 0);
+        rand::thread_rng().fill_bytes(&mut payload);
+        let payload = Arc::new(payload);
+        {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                stream_a.write_all(&payload).await.unwrap();
+                stream_a.shutdown().await.unwrap();
+            });
+        }
+        let mut buf = Vec::new();
+        buf.resize(0x100000, 0);
+        stream_b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], &payload[..]);
     }
 }
